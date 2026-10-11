@@ -1,8 +1,17 @@
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
+#include "error_util.h"
 
 #include "../op_kernel/linalg_lstsq_tiling.h"
 #include "../op_kernel/tiling_key_linalg_lstsq.h"
+
+namespace {
+// Usable Unified Buffer per AIV core on Ascend 910B (~192 KB) minus headroom.
+constexpr size_t kUbBudgetBytes = 176 * 1024;
+// Number of semi-normal iterative-refinement passes.  3 is enough to take a
+// x0 with ~1e-1 relative error down to ~1e-7 at cond(A)=1e3 (see docs).
+constexpr uint32_t kRefineIters = 3;
+}  // namespace
 
 namespace optiling {
     static ge::graphStatus TilingFunc(gert::TilingContext *context) {
@@ -50,6 +59,40 @@ namespace optiling {
                 b_has_batch = (batch_size > 1) ? 1 : 0;
             }
         }
+        if (m == 0) m = 1;
+        if (n == 0) n = 1;
+        if (k == 0) k = 1;
+        if (batch_size == 0) batch_size = 1;
+
+        // ------------------------------------------------------------------
+        // Size the row-block so the kernel's UB footprint fits the budget.
+        //   fixed (floats) = 2*n*ns + 3*n*ks + 3*ks + 10*max(ns,ks)
+        //   per-row (floats) = ns + 3*ks
+        // ------------------------------------------------------------------
+        const uint32_t ns = (n + 7u) / 8u * 8u;
+        const uint32_t ks = (k + 7u) / 8u * 8u;
+        const uint32_t tmp_len = (ns > ks) ? ns : ks;
+
+        const size_t fixed_floats =
+            static_cast<size_t>(2) * n * ns + static_cast<size_t>(3) * n * ks +
+            static_cast<size_t>(3) * ks + static_cast<size_t>(10) * tmp_len;
+        const size_t per_row_floats = static_cast<size_t>(ns) + 3u * static_cast<size_t>(ks);
+        const size_t budget_floats = kUbBudgetBytes / sizeof(float);
+
+        if (fixed_floats >= budget_floats) {
+            OP_LOGE(context->GetNodeName(),
+                    "linalg_lstsq: n=%u too large for the AIV Unified Buffer "
+                    "(need %zu floats for the n x n Gram factor alone, budget %zu). "
+                    "Reduce n or tile the Cholesky.",
+                    n, fixed_floats, budget_floats);
+            return ge::GRAPH_FAILED;
+        }
+
+        size_t block_rows = (budget_floats - fixed_floats) / per_row_floats;
+        if (block_rows > 512) block_rows = 512;
+        block_rows = (block_rows / 8) * 8;   // keep it tidy / 32B friendly
+        if (block_rows < 8) block_rows = 8;
+        if (block_rows > m) block_rows = m;
 
         const gert::Tensor *tensor_A = context->GetRequiredInputTensor(0);
         ge::DataType dtype_A = (tensor_A != nullptr) ? tensor_A->GetDataType() : ge::DT_FLOAT;
@@ -63,14 +106,17 @@ namespace optiling {
         tiling->batch_size = batch_size;
         tiling->has_residuals = (m > n) ? 1 : 0;
         tiling->b_has_batch = b_has_batch;
+        tiling->block_rows = static_cast<uint32_t>(block_rows);
+        tiling->nref = kRefineIters;
+        tiling->core_num = static_cast<uint32_t>(num_cores_aiv);
+        tiling->reserved = 0;
 
         context->SetBlockDim(num_cores_aiv);
 
-        // Workspace allocation: allocate scratch memory for intermediate QR factors and transposes
-        size_t ws_floats = static_cast<size_t>(num_cores_aiv) * (m * n + m * k + n * k) * 2;
-        if (ws_floats < 2 * 1024 * 1024) ws_floats = 2 * 1024 * 1024;
+        // The kernel streams A/B straight from GM and keeps every intermediate in
+        // UB, so no user workspace is required.
         size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-        currentWorkspace[0] = ws_floats * sizeof(float);
+        currentWorkspace[0] = 0;
         return ge::GRAPH_SUCCESS;
     }
 }  // namespace optiling

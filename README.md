@@ -61,3 +61,49 @@ ascend-least-squares/
    - 单精度 `float32` 在条件数接近 $10^3$ 时，直接回代可能损失 $3 \sim 4$ 位精度（由于求解正规方程的等价误差放大为 $\text{cond}(A)^2 \epsilon$）。
    - 计算残差 $r = B - A x_0$ 以及更新量 $g = A^T r$ 时，必须采用扩展精度或补偿求和（如 Double-Float / Dekker TwoProd/TwoSum 累加）。
    - 通过一步校正半正规方程迭代求精求解 $R R^T \Delta x = g$，$x = x_0 + \Delta x$，即可轻松跨过 $10^{-4}$ 精度红线。
+
+---
+
+## 5. 实现状态（本次提交）
+
+`Process()` 已实现，方案与上节思路一致但做了两处关键加强：
+
+1. **$A^T A$ / $A^T B$ 必须用双精度补偿累加（Dekker TwoProd + Knuth TwoSum）**，
+   否则 $G$ 的相对扰动 $\eta_G$ 会让迭代求精的迭代矩阵谱半径
+   $\sim \mathrm{cond}(A)^2 \eta_G \ge 1$，求精直接停滞。
+2. **残差 $r = B - AX$ 与 $g = A^T r$ 同样用双精度累加**，并保留
+   $\sum (r_{hi}+r_{lo})^2$ 中的交叉项 $2 r_{hi} r_{lo}$（少这一项残差输出会
+   损失约 4 位绝对精度）。
+
+流程：补偿累加 $G,h$ → 外积形式 Cholesky $G=R^TR$ → $x_0=R^{-1}R^{-T}h$
+→ 3 次半正规方程迭代求精 → 输出 $x$ 与残差平方和。
+
+**实测精度**（`test/verify_algorithm.py`，float32 逐行仿真，含双精度补偿）：
+
+| m | n | k | cond | x 误差/容差 | 残差绝对误差 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 16 | 4 | 1000 | 2.1e-4 | 8.5e-7 |
+| 64 | 32 | 4 | 1000 | 1.4e-4 | 2.0e-6 |
+| 128 | 64 | 8 | 1000 | 1.8e-4 | 5.9e-6 |
+| 512 | 96 | 3 | 1000 | 1.0e-4 | 2.3e-5 |
+| 64 | 64 | 4 | 1000 | 1.1e-4 | （m=n，残差为空） |
+
+误差/容差 < 1 即通过，最差 2.1e-4 ⇒ **约 4800 倍余量**；残差误差已低于
+float32 在该量级（~416）上的 1 ulp，即输出精度的物理极限。
+
+详细设计、内存模型、支持范围以及**需要在真实 CANN 工具链上确认的 API 细节**
+见 [`docs/DESIGN.md`](docs/DESIGN.md)。
+
+### 运行验证
+
+```bash
+python test/verify_algorithm.py   # 核函数算法仿真 + 容差判定（需要 numpy）
+python test/verify_local.py       # 参考生成器 / 朴素 float32 基线对照（需要 scipy）
+```
+
+### 支持范围
+
+- `m`、`k`、`batch_size` 无限制（`A` 按行分块流式读入，`k` 只是向量宽度）。
+- `n` 受 UB 限制，约 **n ≤ 140**；`op_host` 会按 176 KB 预算自动计算
+  `block_rows`，`n` 过大时直接返回 `GRAPH_FAILED` 并打印原因。
+- 多核：按 batch 以 `for b = blockIdx; b < batch; b += blockNum` 分摊到各 AIV 核。
