@@ -92,7 +92,7 @@ public:
         pipe_.InitBuffer(rHiBuf_, blockRows_ * ks_ * sizeof(float));
         pipe_.InitBuffer(rLoBuf_, blockRows_ * ks_ * sizeof(float));
         pipe_.InitBuffer(resBuf_, 3u * ks_ * sizeof(float));
-        pipe_.InitBuffer(tmpBuf_, 8u * tmpLen_ * sizeof(float));
+        pipe_.InitBuffer(tmpBuf_, 10u * tmpLen_ * sizeof(float));
 
         g_ = gBuf_.Get<float>();
         gLo_ = gLoBuf_.Get<float>();

@@ -242,7 +242,7 @@ class LstsqKernelSim:
 # ---------------------------------------------------------------------------
 def lstsq_f64(A64, B64):
     if _HAVE_SCIPY:
-        X, res, _, _ = scipy.linalg.lstsq(A64, B64, lapack_driver="gels")
+        X, res, _, _ = scipy.linalg.lstsq(A64, B64, lapack_driver="gelsy")
         return X, res
     X, res, _, _ = np.linalg.lstsq(A64, B64, rcond=None)
     return X, res
